@@ -1,0 +1,3847 @@
+{
+  "name": "gameworld",
+  "version": "1.0.0",
+  "description": "GameWorld online multiplayer game platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const WebSocket = require("ws");
+
+const PORT = process.env.PORT || 3000;
+const PUBLIC = path.join(__dirname, "public");
+
+const games = [
+  { id: "mafia", name: "مافیا", min: 4, max: 12 },
+  { id: "chess", name: "شطرنج", min: 2, max: 2 },
+  { id: "hokm", name: "حکم", min: 4, max: 4 },
+  { id: "uno", name: "UNO", min: 2, max: 8 },
+  { id: "word", name: "حدس کلمه", min: 2, max: 10 },
+  { id: "quiz", name: "مسابقه اطلاعات عمومی", min: 2, max: 20 },
+  { id: "2048", name: "2048 رقابتی", min: 2, max: 8 },
+  { id: "minesweeper", name: "مین‌یاب", min: 1, max: 8 },
+  { id: "speed", name: "پازل سرعتی", min: 2, max: 10 },
+  { id: "rps", name: "سنگ کاغذ قیچی", min: 2, max: 2 },
+  { id: "target", name: "هدف‌گیری", min: 1, max: 8 },
+  { id: "racing", name: "مسابقه ماشین", min: 2, max: 8 },
+  { id: "running", name: "دو سرعت", min: 2, max: 20 },
+  { id: "survival", name: "بقا مقابل هیولا", min: 1, max: 8 },
+  { id: "archery", name: "نبرد تیر و کمان", min: 2, max: 8 },
+  { id: "duel", name: "دوئل", min: 2, max: 2 },
+  { id: "castle", name: "دفاع از قلعه", min: 1, max: 8 },
+  { id: "coins", name: "جمع‌آوری سکه", min: 1, max: 12 },
+  { id: "hidden", name: "اشیای مخفی", min: 1, max: 8 },
+  { id: "draw", name: "نقاشی و حدس", min: 2, max: 10 },
+  { id: "treasure", name: "شکار گنج", min: 2, max: 12 },
+  { id: "combine", name: "ترکیب آیتم‌ها", min: 1, max: 8 },
+  { id: "king", name: "پادشاه", min: 2, max: 12 },
+  { id: "role", name: "نقش مخفی", min: 4, max: 12 },
+  { id: "choice", name: "داستان انتخابی", min: 1, max: 8 },
+  { id: "dialogue", name: "گفت‌وگوی اجتماعی", min: 2, max: 12 },
+  { id: "tournament", name: "مسابقه روزانه", min: 2, max: 32 },
+  { id: "dice", name: "تاس", min: 2, max: 12 },
+  { id: "territory", name: "تسخیر قلمرو", min: 2, max: 12 },
+  { id: "final", name: "چالش نهایی", min: 2, max: 20 }
+];
+
+const rooms = new Map();
+const clients = new Map();
+
+function id() {
+  return crypto.randomBytes(5).toString("hex");
+}
+
+function roomCode() {
+  let code;
+  do {
+    code = Math.random().toString(36).slice(2, 7).toUpperCase();
+  } while (rooms.has(code));
+  return code;
+}
+
+function todayPassword() {
+  if (process.env.GAMEWORLD_PASSWORD) {
+    return process.env.GAMEWORLD_PASSWORD;
+  }
+
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+
+  return `GW-${y}-${m}-${day}`;
+}
+
+function send(ws, type, data = {}) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  ws.send(JSON.stringify({
+    type,
+    ...data
+  }));
+}
+
+function broadcast(room, type, data = {}) {
+  for (const player of room.players.values()) {
+    send(player.ws, type, data);
+  }
+}
+
+function publicRoom(room) {
+  return {
+    code: room.code,
+    game: room.game,
+    gameName: games.find(g => g.id === room.game)?.name || room.game,
+    host: room.host,
+    started: room.started,
+    players: [...room.players.values()].map(p => ({
+      id: p.id,
+      name: p.name,
+      avatar: p.avatar,
+      score: p.score,
+      alive: p.alive
+    })),
+    max: games.find(g => g.id === room.game)?.max || 20
+  };
+}
+
+function sendRoom(room) {
+  broadcast(room, "room:update", {
+    room: publicRoom(room)
+  });
+}
+
+function broadcastRooms() {
+  const list = [...rooms.values()].map(publicRoom);
+
+  for (const ws of clients.values()) {
+    send(ws, "rooms:list", { rooms: list });
+  }
+}
+
+function getPlayer(ws) {
+  return clients.get(ws);
+}
+
+function getRoom(ws) {
+  const player = getPlayer(ws);
+  if (!player || !player.room) return null;
+  return rooms.get(player.room) || null;
+}
+
+function createPlayer(ws, name, avatar) {
+  const player = {
+    id: id(),
+    ws,
+    name: String(name || "بازیکن").slice(0, 24),
+    avatar: String(avatar || "👤").slice(0, 8),
+    room: null,
+    score: 0,
+    alive: true
+  };
+
+  clients.set(ws, player);
+  return player;
+}
+
+function leaveRoom(player) {
+  if (!player || !player.room) return;
+
+  const room = rooms.get(player.room);
+
+  if (!room) {
+    player.room = null;
+    return;
+  }
+
+  room.players.delete(player.id);
+  player.room = null;
+
+  if (room.host === player.id) {
+    const next = room.players.values().next().value;
+    room.host = next ? next.id : null;
+  }
+
+  if (room.players.size === 0) {
+    rooms.delete(room.code);
+  } else {
+    sendRoom(room);
+  }
+
+  broadcastRooms();
+}
+
+function newRoom(game) {
+  return {
+    code: roomCode(),
+    game,
+    host: null,
+    started: false,
+    createdAt: Date.now(),
+    players: new Map(),
+
+    state: {
+      turn: null,
+      round: 1,
+      winner: null,
+      data: {}
+    }
+  };
+}
+
+function initGame(room) {
+  room.state = {
+    turn: [...room.players.keys()][0] || null,
+    round: 1,
+    winner: null,
+    data: {}
+  };
+
+  for (const p of room.players.values()) {
+    p.score = 0;
+    p.alive = true;
+  }
+
+  switch (room.game) {
+    case "rps":
+      room.state.data.moves = {};
+      break;
+
+    case "dice":
+      room.state.data.rolls = {};
+      break;
+
+    case "quiz":
+      room.state.data.question = randomQuiz();
+      room.state.data.answers = {};
+      break;
+
+    case "word":
+      room.state.data.word = randomWord();
+      room.state.data.guesses = [];
+      break;
+
+    case "target":
+      room.state.data.targets = 10;
+      room.state.data.hits = {};
+      break;
+
+    case "coins":
+      room.state.data.coins = 30;
+      room.state.data.collected = {};
+      break;
+
+    case "territory":
+      room.state.data.map = createTerritoryMap();
+      break;
+
+    case "minesweeper":
+      room.state.data.board = createMineBoard(8, 8, 10);
+      break;
+
+    case "mafia":
+      initMafia(room);
+      break;
+
+    case "chess":
+      room.state.data.board = createChessBoard();
+      room.state.data.turn = "white";
+      break;
+
+    default:
+      room.state.data = {
+        progress: {},
+        actions: []
+      };
+  }
+}
+
+function randomWord() {
+  const words = [
+    "کتاب",
+    "درخت",
+    "خانه",
+    "خورشید",
+    "دریا",
+    "شمشیر",
+    "اژدها",
+    "قلعه",
+    "جنگل",
+    "ماه"
+  ];
+
+  return words[Math.floor(Math.random() * words.length)];
+}
+
+function randomQuiz() {
+  const questions = [
+    {
+      q: "پایتخت فرانسه کدام است؟",
+      options: ["پاریس", "رم", "برلین", "مادرید"],
+      answer: 0
+    },
+    {
+      q: "بزرگ‌ترین سیاره منظومه شمسی کدام است؟",
+      options: ["زمین", "مریخ", "مشتری", "زهره"],
+      answer: 2
+    },
+    {
+      q: "آب در چند درجه سانتی‌گراد می‌جوشد؟",
+      options: ["50", "100", "150", "200"],
+      answer: 1
+    }
+  ];
+
+  return questions[Math.floor(Math.random() * questions.length)];
+}
+
+function initMafia(room) {
+  const players = [...room.players.values()];
+  const roles = [];
+
+  if (players.length >= 4) roles.push("مافیا");
+
+  while (roles.length < players.length) {
+    roles.push("شهروند");
+  }
+
+  if (players.length >= 5) roles[1] = "دکتر";
+  if (players.length >= 6) roles[2] = "کارآگاه";
+
+  for (let i = roles.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [roles[i], roles[j]] = [roles[j], roles[i]];
+  }
+
+  room.state.data = {
+    phase: "night",
+    day: 1,
+    roles: {},
+    nightActions: {},
+    votes: {},
+    eliminated: []
+  };
+
+  players.forEach((p, i) => {
+    room.state.data.roles[p.id] = roles[i];
+  });
+}
+
+function createChessBoard() {
+  const board = [];
+
+  for (let y = 0; y < 8; y++) {
+    board[y] = [];
+
+    for (let x = 0; x < 8; x++) {
+      board[y][x] = null;
+    }
+  }
+
+  const back = [
+    "rook",
+    "knight",
+    "bishop",
+    "queen",
+    "king",
+    "bishop",
+    "knight",
+    "rook"
+  ];
+
+  for (let x = 0; x < 8; x++) {
+    board[0][x] = { c: "black", p: back[x] };
+    board[1][x] = { c: "black", p: "pawn" };
+    board[6][x] = { c: "white", p: "pawn" };
+    board[7][x] = { c: "white", p: back[x] };
+  }
+
+  return board;
+}
+
+function createMineBoard(w, h, mines) {
+  const cells = [];
+
+  for (let i = 0; i < w * h; i++) {
+    cells.push({
+      mine: false,
+      open: false,
+      n: 0
+    });
+  }
+
+  let placed = 0;
+
+  while (placed < mines) {
+    const i = Math.floor(Math.random() * cells.length);
+
+    if (!cells[i].mine) {
+      cells[i].mine = true;
+      placed++;
+    }
+  }
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+
+      if (cells[i].mine) continue;
+
+      let count = 0;
+
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (!dx && !dy) continue;
+
+          const nx = x + dx;
+          const ny = y + dy;
+
+          if (
+            nx >= 0 &&
+            nx < w &&
+            ny >= 0 &&
+            ny < h &&
+            cells[ny * w + nx].mine
+          ) {
+            count++;
+          }
+        }
+      }
+
+      cells[i].n = count;
+    }
+  }
+
+  return {
+    w,
+    h,
+    cells
+  };
+}
+
+function createTerritoryMap() {
+  return Array.from({ length: 25 }, () => null);
+}
+
+function handleMove(player, move) {
+  const room = getRoom(player.ws);
+
+  if (!room || !room.started) return;
+
+  if (!move || typeof move !== "object") return;
+
+  switch (room.game) {
+    case "rps":
+      rpsMove(room, player, move);
+      break;
+
+    case "dice":
+      diceMove(room, player);
+      break;
+
+    case "quiz":
+      quizMove(room, player, move);
+      break;
+
+    case "word":
+      wordMove(room, player, move);
+      break;
+
+    case "target":
+      targetMove(room, player, move);
+      break;
+
+    case "coins":
+      coinMove(room, player, move);
+      break;
+
+    case "territory":
+      territoryMove(room, player, move);
+      break;
+
+    case "minesweeper":
+      mineMove(room, player, move);
+      break;
+
+    case "chess":
+      chessMove(room, player, move);
+      break;
+
+    case "mafia":
+      mafiaMove(room, player, move);
+      break;
+
+    default:
+      genericMove(room, player, move);
+      break;
+  }
+}
+
+function rpsMove(room, player, move) {
+  const allowed = ["rock", "paper", "scissors"];
+
+  if (!allowed.includes(move.value)) return;
+
+  room.state.data.moves[player.id] = move.value;
+
+  const ids = [...room.players.keys()];
+
+  if (ids.every(i => room.state.data.moves[i])) {
+    const values = ids.map(i => room.state.data.moves[i]);
+
+    if (values.length === 2 && values[0] !== values[1]) {
+      const a = values[0];
+      const b = values[1];
+
+      const win =
+        (a === "rock" && b === "scissors") ||
+        (a === "paper" && b === "rock") ||
+        (a === "scissors" && b === "paper");
+
+      const winner = win ? ids[0] : ids[1];
+
+      room.players.get(winner).score++;
+    }
+
+    room.state.round++;
+    room.state.data.moves = {};
+
+    broadcast(room, "game:event", {
+      event: "rps:round",
+      scores: [...room.players.values()].map(p => ({
+        id: p.id,
+        score: p.score
+      }))
+    });
+  }
+
+  sendGameState(room);
+}
+
+function diceMove(room, player) {
+  if (room.state.data.rolls[player.id]) return;
+
+  room.state.data.rolls[player.id] =
+    Math.floor(Math.random() * 6) + 1;
+
+  if (
+    [...room.players.keys()].every(
+      id => room.state.data.rolls[id]
+    )
+  ) {
+    let winner = null;
+    let best = -1;
+
+    for (const [id, value] of Object.entries(
+      room.state.data.rolls
+    )) {
+      if (value > best) {
+        best = value;
+        winner = id;
+      }
+    }
+
+    if (winner) room.players.get(winner).score++;
+
+    room.state.data.rolls = {};
+    room.state.round++;
+  }
+
+  sendGameState(room);
+}
+
+function quizMove(room, player, move) {
+  if (room.state.data.answers[player.id] !== undefined) return;
+
+  const answer = Number(move.answer);
+
+  room.state.data.answers[player.id] = answer;
+
+  if (answer === room.state.data.question.answer) {
+    player.score++;
+  }
+
+  if (
+    [...room.players.keys()].every(
+      id => room.state.data.answers[id] !== undefined
+    )
+  ) {
+    room.state.round++;
+    room.state.data.question = randomQuiz();
+    room.state.data.answers = {};
+  }
+
+  sendGameState(room);
+}
+
+function wordMove(room, player, move) {
+  const guess = String(move.guess || "")
+    .trim()
+    .toLowerCase();
+
+  if (!guess) return;
+
+  room.state.data.guesses.push({
+    player: player.id,
+    guess
+  });
+
+  if (
+    guess === room.state.data.word.toLowerCase()
+  ) {
+    player.score += 5;
+
+    room.state.round++;
+    room.state.data.word = randomWord();
+    room.state.data.guesses = [];
+  }
+
+  sendGameState(room);
+}
+
+function targetMove(room, player, move) {
+  if (move.hit !== true) return;
+
+  player.score += 1;
+
+  room.state.data.hits[player.id] =
+    (room.state.data.hits[player.id] || 0) + 1;
+
+  sendGameState(room);
+}
+
+function coinMove(room, player, move) {
+  const index = Number(move.index);
+
+  if (
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= room.state.data.coins
+  ) {
+    return;
+  }
+
+  const key = String(index);
+
+  if (room.state.data.collected[key]) return;
+
+  room.state.data.collected[key] = player.id;
+  player.score++;
+
+  sendGameState(room);
+}
+
+function territoryMove(room, player, move) {
+  const index = Number(move.index);
+
+  if (
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= room.state.data.map.length
+  ) {
+    return;
+  }
+
+  if (room.state.data.map[index] !== null) return;
+
+  room.state.data.map[index] = player.id;
+  player.score++;
+
+  sendGameState(room);
+}
+
+function mineMove(room, player, move) {
+  const i = Number(move.index);
+  const board = room.state.data.board;
+
+  if (
+    !Number.isInteger(i) ||
+    i < 0 ||
+    i >= board.cells.length
+  ) {
+    return;
+  }
+
+  const cell = board.cells[i];
+
+  if (cell.open) return;
+
+  cell.open = true;
+
+  if (cell.mine) {
+    player.score = Math.max(0, player.score - 3);
+  } else {
+    player.score++;
+  }
+
+  sendGameState(room);
+}
+
+function chessMove(room, player, move) {
+  const players = [...room.players.values()];
+
+  if (players.length < 2) return;
+
+  const color =
+    player.id === players[0].id
+      ? "white"
+      : "black";
+
+  if (room.state.data.turn !== color) return;
+
+  const board = room.state.data.board;
+
+  const fx = Number(move.fromX);
+  const fy = Number(move.fromY);
+  const tx = Number(move.toX);
+  const ty = Number(move.toY);
+
+  if (
+    [fx, fy, tx, ty].some(
+      n => !Number.isInteger(n) || n < 0 || n > 7
+    )
+  ) {
+    return;
+  }
+
+  const piece = board[fy][fx];
+
+  if (!piece || piece.c !== color) return;
+
+  const target = board[ty][tx];
+
+  if (target && target.c === color) return;
+
+  if (target && target.p === "king") {
+    player.score += 10;
+    room.state.winner = player.id;
+  }
+
+  board[ty][tx] = piece;
+  board[fy][fx] = null;
+
+  room.state.data.turn =
+    color === "white" ? "black" : "white";
+
+  sendGameState(room);
+}
+
+function mafiaMove(room, player, move) {
+  const data = room.state.data;
+  const role = data.roles[player.id];
+
+  if (data.phase === "night") {
+    if (
+      !["مافیا", "دکتر", "کارآگاه"].includes(role)
+    ) {
+      return;
+    }
+
+    const target = String(move.target || "");
+
+    if (!room.players.has(target)) return;
+
+    data.nightActions[player.id] = {
+      role,
+      target
+    };
+
+    const specialPlayers = [...room.players.values()]
+      .filter(p =>
+        ["مافیا", "دکتر", "کارآگاه"]
+          .includes(data.roles[p.id])
+      )
+      .filter(p => p.alive);
+
+    if (
+      specialPlayers.every(
+        p => data.nightActions[p.id]
+      )
+    ) {
+      resolveNight(room);
+    }
+  }
+
+  else if (data.phase === "day") {
+    const target = String(move.target || "");
+
+    if (!room.players.has(target)) return;
+    if (target === player.id) return;
+    if (!player.alive) return;
+
+    data.votes[player.id] = target;
+
+    const alive = [...room.players.values()]
+      .filter(p => p.alive);
+
+    if (
+      alive.every(
+        p => data.votes[p.id]
+      )
+    ) {
+      resolveVotes(room);
+    }
+  }
+
+  sendGameState(room);
+}
+
+function resolveNight(room) {
+  const data = room.state.data;
+
+  let mafiaTarget = null;
+  let doctorTarget = null;
+
+  for (const action of Object.values(data.nightActions)) {
+    if (action.role === "مافیا") {
+      mafiaTarget = action.target;
+    }
+
+    if (action.role === "دکتر") {
+      doctorTarget = action.target;
+    }
+  }
+
+  if (
+    mafiaTarget &&
+    mafiaTarget !== doctorTarget
+  ) {
+    const victim = room.players.get(mafiaTarget);
+
+    if (victim) {
+      victim.alive = false;
+      data.eliminated.push(victim.id);
+    }
+  }
+
+  data.day++;
+  data.phase = "day";
+  data.nightActions = {};
+  data.votes = {};
+
+  checkMafiaWinner(room);
+}
+
+function resolveVotes(room) {
+  const data = room.state.data;
+  const counts = {};
+
+  for (const target of Object.values(data.votes)) {
+    counts[target] = (counts[target] || 0) + 1;
+  }
+
+  let target = null;
+  let best = 0;
+
+  for (const [id, count] of Object.entries(counts)) {
+    if (count > best) {
+      best = count;
+      target = id;
+    }
+  }
+
+  if (target) {
+    const p = room.players.get(target);
+
+    if (p) {
+      p.alive = false;
+      data.eliminated.push(target);
+    }
+  }
+
+  data.phase = "night";
+  data.nightActions = {};
+  data.votes = {};
+
+  checkMafiaWinner(room);
+}
+
+function checkMafiaWinner(room) {
+  const data = room.state.data;
+
+  const alive = [...room.players.values()]
+    .filter(p => p.alive);
+
+  const mafia = alive.filter(
+    p => data.roles[p.id] === "مافیا"
+  );
+
+  const citizens = alive.filter(
+    p => data.roles[p.id] !== "مافیا"
+  );
+
+  if (mafia.length === 0) {
+    room.state.winner = "citizens";
+    return;
+  }
+
+  if (mafia.length >= citizens.length) {
+    room.state.winner = "mafia";
+  }
+}
+
+function genericMove(room, player, move) {
+  const value = Number(move.value || 1);
+
+  if (!Number.isFinite(value)) return;
+
+  player.score += Math.max(
+    0,
+    Math.min(10, value)
+  );
+
+  room.state.data.actions.push({
+    player: player.id,
+    value,
+    time: Date.now()
+  });
+
+  sendGameState(room);
+}
+
+function publicGameState(room, player) {
+  const data = room.state.data;
+
+  const result = {
+    game: room.game,
+    round: room.state.round,
+    turn: room.state.turn,
+    winner: room.state.winner,
+    scores: [...room.players.values()].map(p => ({
+      id: p.id,
+      name: p.name,
+      avatar: p.avatar,
+      score: p.score,
+      alive: p.alive
+    })),
+    data: {}
+  };
+
+  if (room.game === "mafia") {
+    result.data = {
+      phase: data.phase,
+      day: data.day,
+      alive: [...room.players.values()]
+        .filter(p => p.alive)
+        .map(p => p.id),
+      role: data.roles[player.id],
+      winner: room.state.winner
+    };
+  }
+
+  else if (room.game === "minesweeper") {
+    result.data = {
+      w: data.board.w,
+      h: data.board.h,
+      cells: data.board.cells.map(c => ({
+        open: c.open,
+        n: c.open ? c.n : null,
+        mine: c.open && c.mine
+      }))
+    };
+  }
+
+  else {
+    result.data = data;
+  }
+
+  return result;
+}
+
+function sendGameState(room) {
+  for (const p of room.players.values()) {
+    send(p.ws, "game:state", {
+      state: publicGameState(room, p)
+    });
+  }
+}
+
+const server = http.createServer((req, res) => {
+  let file = req.url === "/" ? "index.html" : req.url.slice(1);
+
+  file = file.split("?")[0];
+
+  const full = path.normalize(
+    path.join(PUBLIC, file)
+  );
+
+  if (!full.startsWith(PUBLIC)) {
+    res.writeHead(403);
+    res.end("Forbidden");
+    return;
+  }
+
+  fs.readFile(full, (err, data) => {
+    if (err) {
+      res.writeHead(404);
+      res.end("Not found");
+      return;
+    }
+
+    const ext = path.extname(full);
+
+    const types = {
+      ".html": "text/html; charset=utf-8",
+      ".css": "text/css; charset=utf-8",
+      ".js": "application/javascript; charset=utf-8",
+      ".json": "application/json; charset=utf-8",
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".svg": "image/svg+xml"
+    };
+
+    res.writeHead(200, {
+      "Content-Type":
+        types[ext] || "application/octet-stream"
+    });
+
+    res.end(data);
+  });
+});
+
+const wss = new WebSocket.Server({
+  server
+});
+
+wss.on("connection", ws => {
+  const player = createPlayer(
+    ws,
+    "بازیکن",
+    "👤"
+  );
+
+  send(ws, "hello", {
+    id: player.id,
+    password: todayPassword(),
+    games
+  });
+
+  broadcastRooms();
+
+  ws.on("message", raw => {
+    let msg;
+
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+
+    const p = getPlayer(ws);
+
+    if (!p) return;
+
+    switch (msg.type) {
+      case "profile":
+        p.name = String(
+          msg.name || "بازیکن"
+        ).slice(0, 24);
+
+        p.avatar = String(
+          msg.avatar || "👤"
+        ).slice(0, 8);
+
+        const profileRoom = getRoom(ws);
+
+        if (profileRoom) {
+          sendRoom(profileRoom);
+        }
+
+        break;
+
+      case "rooms:get":
+        broadcastRooms();
+        break;
+
+      case "room:create": {
+        const game = String(msg.game || "mafia");
+
+        if (!games.some(g => g.id === game)) {
+          send(ws, "error", {
+            message: "بازی انتخاب‌شده وجود ندارد."
+          });
+          return;
+        }
+
+        leaveRoom(p);
+
+        const room = newRoom(game);
+
+        room.host = p.id;
+        room.players.set(p.id, p);
+        p.room = room.code;
+
+        sendRoom(room);
+        broadcastRooms();
+
+        break;
+      }
+
+      case "room:join": {
+        const code = String(
+          msg.code || ""
+        ).trim().toUpperCase();
+
+        const room = rooms.get(code);
+
+        if (!room) {
+          send(ws, "error", {
+            message: "اتاق پیدا نشد."
+          });
+          return;
+        }
+
+        if (room.started) {
+          send(ws, "error", {
+            message: "بازی شروع شده است."
+          });
+          return;
+        }
+
+        const gameInfo = games.find(
+          g => g.id === room.game
+        );
+
+        if (
+          gameInfo &&
+          room.players.size >= gameInfo.max
+        ) {
+          send(ws, "error", {
+            message: "ظرفیت اتاق تکمیل است."
+          });
+          return;
+        }
+
+        leaveRoom(p);
+
+        room.players.set(p.id, p);
+        p.room = room.code;
+
+        sendRoom(room);
+        broadcastRooms();
+
+        break;
+      }
+
+      case "room:game": {
+        const room = getRoom(ws);
+
+        if (!room) return;
+        if (room.host !== p.id) return;
+        if (room.started) return;
+
+        const game = String(msg.game || "");
+
+        if (!games.some(g => g.id === game)) return;
+
+        room.game = game;
+
+        sendRoom(room);
+        broadcastRooms();
+
+        break;
+      }
+
+      case "room:start": {
+        const room = getRoom(ws);
+
+        if (!room) return;
+        if (room.host !== p.id) return;
+
+        const info = games.find(
+          g => g.id === room.game
+        );
+
+        if (
+          info &&
+          room.players.size < info.min
+        ) {
+          send(ws, "error", {
+            message:
+              `برای شروع حداقل ${info.min} بازیکن لازم است.`
+          });
+          return;
+        }
+
+        room.started = true;
+        initGame(room);
+
+        sendRoom(room);
+        sendGameState(room);
+
+        break;
+      }
+
+      case "room:leave":
+        leaveRoom(p);
+        break;
+
+      case "chat": {
+        const room = getRoom(ws);
+
+        if (!room) return;
+
+        const text = String(
+          msg.text || ""
+        ).trim().slice(0, 500);
+
+        if (!text) return;
+
+        broadcast(room, "chat", {
+          player: {
+            id: p.id,
+            name: p.name,
+            avatar: p.avatar
+          },
+          text,
+          time: Date.now()
+        });
+
+        break;
+      }
+
+      case "game:move":
+        handleMove(p, msg.move || {});
+        break;
+    }
+  });
+
+  ws.on("close", () => {
+    const p = getPlayer(ws);
+
+    if (p) {
+      leaveRoom(p);
+      clients.delete(ws);
+    }
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(
+    `GameWorld running on http://localhost:${PORT}`
+  );
+});
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport"
+        content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+
+  <meta name="theme-color" content="#111111">
+
+  <title>GameWorld</title>
+
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+  <!-- =========================
+       صفحه ورود
+  ========================== -->
+
+  <section id="loginScreen" class="screen active">
+
+    <div class="login-box">
+
+      <div class="logo">
+        🎮
+      </div>
+
+      <h1>GameWorld</h1>
+
+      <p class="subtitle">
+        دنیای بازی‌های آنلاین
+      </p>
+
+      <div class="group-box">
+
+        <h3>ورود به GameWorld</h3>
+
+        <p>
+          برای ورود ابتدا در گروه ما عضو شوید.
+        </p>
+
+        <a
+          class="balle-button"
+          href="https://ble.ir/join/EsxwRQW2v4"
+          target="_blank">
+          📢 ورود به گروه بله
+        </a>
+
+        <input
+          id="passwordInput"
+          type="text"
+          autocomplete="off"
+          placeholder="رمز امروز را وارد کنید">
+
+        <button id="loginButton" class="primary">
+          ورود به بازی
+        </button>
+
+        <p id="loginMessage" class="message"></p>
+
+      </div>
+
+    </div>
+
+  </section>
+
+
+  <!-- =========================
+       صفحه اصلی
+  ========================== -->
+
+  <section id="homeScreen" class="screen">
+
+    <header class="topbar">
+
+      <div class="brand">
+        🎮 GameWorld
+      </div>
+
+      <div class="connection">
+        <span id="connectionDot"></span>
+        <span id="connectionText">
+          در حال اتصال...
+        </span>
+      </div>
+
+    </header>
+
+
+    <main class="container">
+
+      <!-- پروفایل -->
+
+      <section class="panel profile-panel">
+
+        <div class="avatar" id="profileAvatar">
+          👤
+        </div>
+
+        <div class="profile-info">
+
+          <h2 id="profileName">
+            بازیکن
+          </h2>
+
+          <span id="playerId">
+            ID: -
+          </span>
+
+        </div>
+
+        <button id="editProfileButton"
+                class="small-button">
+          ✏️
+        </button>
+
+      </section>
+
+
+      <!-- ویرایش پروفایل -->
+
+      <section id="profileEditor"
+               class="panel hidden">
+
+        <h3>
+          👤 پروفایل
+        </h3>
+
+        <input
+          id="nameInput"
+          type="text"
+          maxlength="24"
+          placeholder="نام بازیکن">
+
+        <div class="avatar-select">
+
+          <button data-avatar="👤">👤</button>
+          <button data-avatar="😎">😎</button>
+          <button data-avatar="👽">👽</button>
+          <button data-avatar="🤖">🤖</button>
+          <button data-avatar="🦊">🦊</button>
+          <button data-avatar="🐺">🐺</button>
+          <button data-avatar="🧙">🧙</button>
+          <button data-avatar="🥷">🥷</button>
+
+        </div>
+
+        <button id="saveProfileButton"
+                class="primary">
+          ذخیره پروفایل
+        </button>
+
+      </section>
+
+
+      <!-- جستجوی بازی -->
+
+      <section class="panel">
+
+        <div class="section-title">
+
+          <div>
+            <h2>🎮 بازی‌ها</h2>
+            <span id="gameCount">
+              30 بازی
+            </span>
+          </div>
+
+        </div>
+
+        <input
+          id="gameSearch"
+          class="search"
+          type="search"
+          placeholder="🔎 جستجوی بازی...">
+
+        <div
+          id="gamesGrid"
+          class="games-grid">
+        </div>
+
+      </section>
+
+
+      <!-- اتاق‌ها -->
+
+      <section class="panel">
+
+        <div class="section-title">
+
+          <div>
+            <h2>🌐 اتاق‌های آنلاین</h2>
+            <span>
+              بازیکنان واقعی
+            </span>
+          </div>
+
+          <button id="refreshRooms"
+                  class="small-button">
+            🔄
+          </button>
+
+        </div>
+
+        <div id="roomsList"
+             class="rooms-list">
+
+          <div class="empty">
+            هنوز اتاقی ساخته نشده.
+          </div>
+
+        </div>
+
+      </section>
+
+    </main>
+
+  </section>
+
+
+  <!-- =========================
+       پنجره ساخت اتاق
+  ========================== -->
+
+  <div id="createRoomModal"
+       class="modal hidden">
+
+    <div class="modal-box">
+
+      <button class="close"
+              data-close="createRoomModal">
+        ✕
+      </button>
+
+      <h2>🏠 ساخت اتاق</h2>
+
+      <p id="selectedGameText">
+        بازی انتخاب نشده
+      </p>
+
+      <button id="confirmCreateRoom"
+              class="primary">
+        ساخت اتاق
+      </button>
+
+    </div>
+
+  </div>
+
+
+  <!-- =========================
+       صفحه اتاق
+  ========================== -->
+
+  <section id="roomScreen"
+           class="screen">
+
+    <header class="topbar">
+
+      <button id="backHome"
+              class="back-button">
+        ←
+      </button>
+
+      <div>
+
+        <strong>
+          اتاق
+        </strong>
+
+        <span id="roomCodeDisplay">
+          -----
+        </span>
+
+      </div>
+
+      <button id="leaveRoomButton"
+              class="danger-button">
+        خروج
+      </button>
+
+    </header>
+
+
+    <main class="container">
+
+      <!-- اطلاعات اتاق -->
+
+      <section class="panel room-header">
+
+        <div>
+
+          <h2 id="roomGameName">
+            بازی
+          </h2>
+
+          <p>
+            کد اتاق:
+            <strong id="roomCodeBig">
+              -----
+            </strong>
+          </p>
+
+        </div>
+
+        <div id="hostBadge"
+             class="badge">
+          👑 میزبان
+        </div>
+
+      </section>
+
+
+      <!-- انتخاب بازی -->
+
+      <section id="gameSelectorPanel"
+               class="panel hidden">
+
+        <h3>
+          🎮 انتخاب بازی
+        </h3>
+
+        <select id="roomGameSelector">
+        </select>
+
+        <button id="changeGameButton"
+                class="primary">
+          تغییر بازی
+        </button>
+
+      </section>
+
+
+      <!-- بازیکنان -->
+
+      <section class="panel">
+
+        <div class="section-title">
+
+          <h3>
+            👥 بازیکنان
+          </h3>
+
+          <span id="playerCount">
+            0 نفر
+          </span>
+
+        </div>
+
+        <div id="playersList"
+             class="players-list">
+        </div>
+
+      </section>
+
+
+      <!-- بازی -->
+
+      <section class="panel game-panel">
+
+        <div class="section-title">
+
+          <h3>
+            🕹️ بازی
+          </h3>
+
+          <span id="gameRound">
+            دور 1
+          </span>
+
+        </div>
+
+        <div id="gameArea">
+
+          <div class="waiting">
+            منتظر شروع بازی...
+          </div>
+
+        </div>
+
+        <button id="startGameButton"
+                class="primary hidden">
+          ▶️ شروع بازی
+        </button>
+
+      </section>
+
+
+      <!-- امتیاز -->
+
+      <section class="panel">
+
+        <h3>
+          🏆 امتیازات
+        </h3>
+
+        <div id="scoreBoard"
+             class="score-board">
+        </div>
+
+      </section>
+
+
+      <!-- چت -->
+
+      <section class="panel chat-panel">
+
+        <h3>
+          💬 گفت‌وگوی اتاق
+        </h3>
+
+        <div id="chatMessages"
+             class="chat-messages">
+        </div>
+
+        <div class="chat-input">
+
+          <input
+            id="chatInput"
+            type="text"
+            maxlength="500"
+            placeholder="پیام...">
+
+          <button id="sendChatButton">
+            ➤
+          </button>
+
+        </div>
+
+      </section>
+
+    </main>
+
+  </section>
+
+
+  <!-- =========================
+       اعلان
+  ========================== -->
+
+  <div id="toast"
+       class="toast">
+  </div>
+
+
+  <script src="app.js"></script>
+
+</body>
+</html>
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  font-family: Arial, "Tahoma", sans-serif;
+  background: #090909;
+  color: #ffffff;
+}
+
+body {
+  overflow-x: hidden;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  cursor: pointer;
+}
+
+.screen {
+  display: none;
+  min-height: 100vh;
+}
+
+.screen.active {
+  display: block;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* Login */
+
+#loginScreen {
+  min-height: 100vh;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background:
+    radial-gradient(
+      circle at top,
+      #252525 0,
+      #0d0d0d 45%,
+      #050505 100%
+    );
+}
+
+#loginScreen.active {
+  display: flex;
+}
+
+.login-box {
+  width: 100%;
+  max-width: 430px;
+  text-align: center;
+}
+
+.logo {
+  width: 90px;
+  height: 90px;
+  margin: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 28px;
+  font-size: 48px;
+  background: #191919;
+  border: 1px solid #333;
+  box-shadow: 0 20px 60px #000;
+}
+
+.login-box h1 {
+  margin: 18px 0 5px;
+  font-size: 34px;
+}
+
+.subtitle {
+  color: #999;
+}
+
+.group-box {
+  margin-top: 25px;
+  padding: 22px;
+  background: #121212;
+  border: 1px solid #292929;
+  border-radius: 22px;
+}
+
+.group-box p {
+  color: #aaa;
+  line-height: 1.8;
+}
+
+.balle-button {
+  display: block;
+  padding: 14px;
+  margin: 15px 0;
+  color: white;
+  text-decoration: none;
+  background: #222;
+  border: 1px solid #444;
+  border-radius: 14px;
+}
+
+input,
+select {
+  width: 100%;
+  padding: 14px;
+  margin: 7px 0;
+  border: 1px solid #333;
+  border-radius: 13px;
+  outline: none;
+  background: #080808;
+  color: white;
+}
+
+input:focus,
+select:focus {
+  border-color: #777;
+}
+
+.primary {
+  width: 100%;
+  padding: 14px;
+  margin-top: 10px;
+  border-radius: 13px;
+  background: #ffffff;
+  color: #000000;
+  font-weight: bold;
+}
+
+.primary:active {
+  transform: scale(.98);
+}
+
+.message {
+  min-height: 20px;
+  font-size: 13px;
+}
+
+/* Header */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  min-height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 15px;
+  background: rgba(10, 10, 10, .94);
+  border-bottom: 1px solid #292929;
+  backdrop-filter: blur(12px);
+}
+
+.brand {
+  font-weight: bold;
+}
+
+.connection {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #aaa;
+  font-size: 12px;
+}
+
+#connectionDot {
+  width: 9px;
+  height: 9px;
+  display: inline-block;
+  border-radius: 50%;
+  background: #777;
+}
+
+#connectionDot.online {
+  background: #fff;
+}
+
+/* Container */
+
+.container {
+  width: 100%;
+  max-width: 850px;
+  margin: auto;
+  padding: 15px;
+}
+
+.panel {
+  margin-bottom: 15px;
+  padding: 17px;
+  border: 1px solid #292929;
+  border-radius: 20px;
+  background: #111;
+}
+
+.section-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.section-title h2,
+.section-title h3 {
+  margin: 0;
+}
+
+.section-title span {
+  color: #777;
+  font-size: 12px;
+}
+
+/* Profile */
+
+.profile-panel {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+}
+
+.avatar {
+  width: 55px;
+  height: 55px;
+  flex: 0 0 55px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 17px;
+  background: #222;
+  font-size: 29px;
+}
+
+.profile-info {
+  flex: 1;
+}
+
+.profile-info h2 {
+  margin: 0 0 5px;
+  font-size: 18px;
+}
+
+.profile-info span {
+  color: #777;
+  font-size: 11px;
+}
+
+.small-button {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  background: #222;
+  color: white;
+}
+
+.avatar-select {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.avatar-select button {
+  padding: 12px;
+  border-radius: 12px;
+  background: #222;
+  font-size: 22px;
+}
+
+/* Games */
+
+.search {
+  margin: 15px 0;
+}
+
+.games-grid {
+  display: grid;
+  grid-template-columns:
+    repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.game-card {
+  position: relative;
+  min-height: 110px;
+  padding: 13px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  border: 1px solid #292929;
+  border-radius: 16px;
+  background: #181818;
+  transition: .15s;
+}
+
+.game-card:active {
+  transform: scale(.97);
+}
+
+.game-number {
+  color: #666;
+  font-size: 11px;
+}
+
+.game-icon {
+  font-size: 30px;
+}
+
+.game-name {
+  font-weight: bold;
+}
+
+.game-meta {
+  color: #777;
+  font-size: 10px;
+}
+
+.game-card button {
+  margin-top: 8px;
+  padding: 9px;
+  border-radius: 10px;
+  background: #303030;
+  color: white;
+}
+
+/* Rooms */
+
+.rooms-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.room-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 13px;
+  border: 1px solid #292929;
+  border-radius: 14px;
+  background: #181818;
+}
+
+.room-info {
+  min-width: 0;
+}
+
+.room-info strong {
+  display: block;
+}
+
+.room-info span {
+  color: #777;
+  font-size: 11px;
+}
+
+.room-card button {
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: #fff;
+  color: #000;
+}
+
+.empty {
+  padding: 25px;
+  text-align: center;
+  color: #666;
+}
+
+/* Modal */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0,0,0,.75);
+}
+
+.modal-box {
+  position: relative;
+  width: 100%;
+  max-width: 400px;
+  padding: 25px;
+  border: 1px solid #333;
+  border-radius: 22px;
+  background: #151515;
+}
+
+.close {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  width: 35px;
+  height: 35px;
+  border-radius: 10px;
+  background: #292929;
+  color: white;
+}
+/* =========================
+   Room
+========================= */
+
+.back-button,
+.danger-button {
+  padding: 10px 13px;
+  border-radius: 10px;
+  background: #222;
+  color: white;
+}
+
+.danger-button {
+  background: #351616;
+}
+
+.room-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.room-header h2 {
+  margin: 0 0 7px;
+}
+
+.room-header p {
+  margin: 0;
+  color: #777;
+}
+
+.badge {
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #222;
+  font-size: 12px;
+}
+
+/* Players */
+.players-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.player-card {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px;
+  border-radius: 13px;
+  background: #191919;
+}
+
+.player-avatar {
+  font-size: 25px;
+}
+
+.player-card .name {
+  font-size: 13px;
+}
+
+.player-card .score {
+  margin-right: auto;
+  color: #888;
+  font-size: 11px;
+}
+
+/* Game */
+.game-panel {
+  min-height: 250px;
+}
+
+.game-area {
+  margin-top: 15px;
+}
+
+.waiting {
+  padding: 45px 15px;
+  text-align: center;
+  color: #777;
+}
+
+.game-message {
+  padding: 15px;
+  margin-bottom: 12px;
+  border-radius: 13px;
+  background: #1c1c1c;
+  line-height: 1.8;
+}
+
+/* RPS */
+.rps-buttons {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.rps-buttons button {
+  padding: 18px 5px;
+  border-radius: 14px;
+  background: #222;
+  color: white;
+  font-size: 23px;
+}
+
+.rps-buttons span {
+  display: block;
+  font-size: 11px;
+  margin-top: 5px;
+}
+
+/* Dice */
+.dice-button {
+  width: 100%;
+  padding: 20px;
+  border-radius: 15px;
+  background: #222;
+  color: white;
+  font-size: 22px;
+}
+
+/* Quiz */
+.quiz-options {
+  display: grid;
+  gap: 8px;
+}
+
+.quiz-options button {
+  padding: 13px;
+  border-radius: 12px;
+  background: #222;
+  color: white;
+  text-align: right;
+}
+
+/* Word */
+.word-form {
+  display: flex;
+  gap: 8px;
+}
+
+.word-form input {
+  margin: 0;
+}
+
+.word-form button {
+  width: 90px;
+  border-radius: 12px;
+  background: white;
+}
+
+/* Target */
+.target-box {
+  position: relative;
+  height: 260px;
+  border-radius: 18px;
+  background: #0c0c0c;
+  overflow: hidden;
+}
+
+.target {
+  position: absolute;
+  width: 55px;
+  height: 55px;
+  border-radius: 50%;
+  background: white;
+  color: black;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: bold;
+}
+
+/* Territory */
+.territory-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 5px;
+}
+
+.territory-cell {
+  aspect-ratio: 1;
+  border-radius: 7px;
+  background: #242424;
+  color: white;
+  font-size: 13px;
+}
+
+.territory-cell.owned {
+  background: #777;
+}
+
+/* Minesweeper */
+.mine-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 3px;
+}
+
+.mine-cell {
+  aspect-ratio: 1;
+  min-width: 0;
+  border-radius: 5px;
+  background: #252525;
+  color: white;
+  font-size: 12px;
+}
+
+.mine-cell.open {
+  background: #555;
+}
+
+/* Chess */
+.chess-board {
+  width: min(100%, 420px);
+  margin: auto;
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  border: 3px solid #333;
+}
+
+.chess-cell {
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: clamp(18px, 7vw, 38px);
+}
+
+.chess-cell.light {
+  background: #c7c7c7;
+  color: #111;
+}
+
+.chess-cell.dark {
+  background: #555;
+  color: #fff;
+}
+
+/* Generic */
+.action-button {
+  width: 100%;
+  padding: 15px;
+  margin-top: 8px;
+  border-radius: 13px;
+  background: #222;
+  color: white;
+}
+
+/* Score */
+.score-board {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.score-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px;
+  border-radius: 11px;
+  background: #191919;
+}
+
+.score-row .points {
+  margin-right: auto;
+  font-weight: bold;
+}
+
+/* Chat */
+.chat-messages {
+  height: 230px;
+  overflow-y: auto;
+  padding: 8px;
+  margin: 10px 0;
+  border-radius: 13px;
+  background: #090909;
+}
+
+.chat-message {
+  margin-bottom: 9px;
+  padding: 8px;
+  border-radius: 10px;
+  background: #191919;
+}
+
+.chat-message strong {
+  font-size: 12px;
+}
+
+.chat-message p {
+  margin: 3px 0 0;
+  color: #ddd;
+  word-break: break-word;
+}
+
+.chat-input {
+  display: flex;
+  gap: 7px;
+}
+
+.chat-input input {
+  margin: 0;
+}
+
+.chat-input button {
+  width: 52px;
+  border-radius: 12px;
+  background: white;
+}
+
+/* Toast */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  z-index: 200;
+  max-width: 90%;
+  padding: 12px 17px;
+  transform: translateX(-50%) translateY(100px);
+  opacity: 0;
+  border-radius: 13px;
+  background: #eee;
+  color: #000;
+  transition: .25s;
+}
+
+.toast.show {
+  transform: translateX(-50%) translateY(0);
+  opacity: 1;
+}
+
+/* Mobile */
+@media (max-width: 430px) {
+  .container {
+    padding: 10px;
+  }
+
+  .panel {
+    padding: 13px;
+    border-radius: 17px;
+  }
+
+  .games-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .players-list {
+    grid-template-columns: 1fr;
+  }
+
+  .room-header {
+    align-items: flex-start;
+  }
+
+  .room-header h2 {
+    font-size: 17px;
+  }
+
+  .game-card {
+    min-height: 105px;
+  }
+}
+/* =========================
+   GameWorld - app.js
+   5-الف — قسمت اول
+========================= */
+
+const state = {
+  ws: null,
+  connected: false,
+
+  player: {
+    id: null,
+    name: "",
+    avatar: "😀"
+  },
+
+  room: null,
+  selectedGame: 1,
+  games: [],
+  rooms: [],
+  messages: []
+};
+
+/* =========================
+   Games
+========================= */
+
+const GAMES = [
+  { id: 1, name: "مافیا", icon: "🕵️" },
+  { id: 2, name: "شطرنج", icon: "♟️" },
+  { id: 3, name: "حکم", icon: "🃏" },
+  { id: 4, name: "UNO", icon: "🎴" },
+  { id: 5, name: "حدس کلمه", icon: "🔤" },
+  { id: 6, name: "مسابقه اطلاعات عمومی", icon: "🧠" },
+  { id: 7, name: "2048 رقابتی", icon: "🔢" },
+  { id: 8, name: "مین‌یاب", icon: "💣" },
+  { id: 9, name: "پازل سرعتی", icon: "🧩" },
+  { id: 10, name: "سنگ کاغذ قیچی", icon: "✊" },
+  { id: 11, name: "تیراندازی به هدف", icon: "🎯" },
+  { id: 12, name: "مسابقه ماشین", icon: "🏎️" },
+  { id: 13, name: "مسابقه دو", icon: "🏃" },
+  { id: 14, name: "بقا در برابر هیولاها", icon: "👹" },
+  { id: 15, name: "نبرد تیر و کمان", icon: "🏹" },
+  { id: 16, name: "دوئل", icon: "⚔️" },
+  { id: 17, name: "دفاع از قلعه", icon: "🏰" },
+  { id: 18, name: "جمع‌آوری سکه", icon: "🪙" },
+  { id: 19, name: "اشیای مخفی", icon: "🔎" },
+  { id: 20, name: "نقاشی و حدس", icon: "🎨" },
+  { id: 21, name: "گنج‌یابی", icon: "💎" },
+  { id: 22, name: "ترکیب آیتم‌ها", icon: "🧪" },
+  { id: 23, name: "پادشاه", icon: "👑" },
+  { id: 24, name: "نقش مخفی", icon: "🎭" },
+  { id: 25, name: "بازی انتخاب", icon: "🔀" },
+  { id: 26, name: "گفت‌وگو", icon: "💬" },
+  { id: 27, name: "مسابقه روزانه", icon: "🏆" },
+  { id: 28, name: "بازی تاس", icon: "🎲" },
+  { id: 29, name: "تسخیر قلمرو", icon: "🗺️" },
+  { id: 30, name: "چالش نهایی", icon: "🔥" }
+];
+
+state.games = GAMES;
+
+/* =========================
+   Helpers
+========================= */
+
+function $(id) {
+  return document.getElementById(id);
+}
+
+function escapeHTML(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function showToast(message) {
+  const toast = $("toast");
+
+  if (!toast) {
+    alert(message);
+    return;
+  }
+
+  toast.textContent = message;
+  toast.classList.add("show");
+
+  clearTimeout(window.__toastTimer);
+
+  window.__toastTimer = setTimeout(() => {
+    toast.classList.remove("show");
+  }, 2500);
+}
+
+function getGame(id) {
+  return GAMES.find(game => Number(game.id) === Number(id));
+}
+
+/* =========================
+   Local Player
+========================= */
+
+function loadPlayer() {
+  try {
+    const saved = localStorage.getItem("gameworld_player");
+
+    if (!saved) return;
+
+    const data = JSON.parse(saved);
+
+    if (data.name) {
+      state.player.name = data.name;
+    }
+
+    if (data.avatar) {
+      state.player.avatar = data.avatar;
+    }
+
+    if (data.id) {
+      state.player.id = data.id;
+    }
+  } catch (error) {
+    console.log("Player data error:", error);
+  }
+}
+
+function savePlayer() {
+  localStorage.setItem(
+    "gameworld_player",
+    JSON.stringify(state.player)
+  );
+}
+
+/* =========================
+   Login
+========================= */
+
+function login() {
+  const nameInput = $("playerName");
+  const avatarInput = $("playerAvatar");
+
+  const name = nameInput
+    ? nameInput.value.trim()
+    : "";
+
+  const avatar = avatarInput
+    ? avatarInput.value.trim()
+    : "";
+
+  if (!name) {
+    showToast("لطفاً نام خود را وارد کنید.");
+    return;
+  }
+
+  state.player.name = name;
+  state.player.avatar = avatar || "😀";
+
+  savePlayer();
+
+  const loginScreen = $("loginScreen");
+  const mainScreen = $("mainScreen");
+
+  if (loginScreen) {
+    loginScreen.classList.add("hidden");
+  }
+
+  if (mainScreen) {
+    mainScreen.classList.remove("hidden");
+  }
+
+  renderGames();
+  connectWebSocket();
+}
+
+/* =========================
+   Profile
+========================= */
+
+function renderProfile() {
+  const name = $("profileName");
+  const avatar = $("profileAvatar");
+
+  if (name) {
+    name.textContent = state.player.name || "بازیکن";
+  }
+
+  if (avatar) {
+    avatar.textContent = state.player.avatar || "😀";
+  }
+}
+
+function updateProfile() {
+  const nameInput = $("profileNameInput");
+  const avatarInput = $("profileAvatarInput");
+
+  if (nameInput && nameInput.value.trim()) {
+    state.player.name = nameInput.value.trim();
+  }
+
+  if (avatarInput && avatarInput.value.trim()) {
+    state.player.avatar = avatarInput.value.trim();
+  }
+
+  savePlayer();
+  renderProfile();
+
+  if (state.connected) {
+    send({
+      type: "profile_update",
+      player: state.player
+    });
+  }
+
+  showToast("پروفایل ذخیره شد.");
+}
+
+/* =========================
+   Game List
+========================= */
+
+function renderGames(filter = "") {
+  const container = $("gamesList");
+
+  if (!container) return;
+
+  const text = filter.trim().toLowerCase();
+
+  const filtered = GAMES.filter(game => {
+    return (
+      !text ||
+      game.name.toLowerCase().includes(text) ||
+      String(game.id).includes(text)
+    );
+  });
+
+  container.innerHTML = filtered.map(game => `
+    <button
+      class="game-card"
+      data-game-id="${game.id}"
+      onclick="selectGame(${game.id})"
+    >
+      <span class="game-icon">${game.icon}</span>
+      <span class="game-number">بازی ${game.id}</span>
+      <strong>${escapeHTML(game.name)}</strong>
+    </button>
+  `).join("");
+}
+
+function selectGame(gameId) {
+  const game = getGame(gameId);
+
+  if (!game) return;
+
+  state.selectedGame = game.id;
+
+  const selectedName = $("selectedGameName");
+
+  if (selectedName) {
+    selectedName.textContent =
+      `${game.icon} ${game.name}`;
+  }
+
+  showToast(`بازی «${game.name}» انتخاب شد.`);
+}
+
+/* =========================
+   Search
+========================= */
+
+function setupSearch() {
+  const search = $("gameSearch");
+
+  if (!search) return;
+
+  search.addEventListener("input", () => {
+    renderGames(search.value);
+  });
+}
+
+/* =========================
+   WebSocket
+========================= */
+
+function connectWebSocket() {
+  if (state.ws) {
+    try {
+      state.ws.close();
+    } catch (_) {}
+  }
+
+  const protocol =
+    location.protocol === "https:"
+      ? "wss:"
+      : "ws:";
+
+  const wsURL =
+    `${protocol}//${location.host}`;
+
+  try {
+    state.ws = new WebSocket(wsURL);
+
+    state.ws.onopen = () => {
+      state.connected = true;
+
+      updateConnectionStatus(true);
+
+      send({
+        type: "hello",
+        player: state.player
+      });
+
+      showToast("اتصال آنلاین برقرار شد.");
+    };
+
+    state.ws.onmessage = event => {
+      try {
+        const message = JSON.parse(event.data);
+        handleOnlineMessage(message);
+      } catch (error) {
+        console.log(
+          "Invalid server message:",
+          event.data
+        );
+      }
+    };
+
+    state.ws.onclose = () => {
+      state.connected = false;
+
+      updateConnectionStatus(false);
+
+      showToast("ارتباط با سرور قطع شد.");
+    };
+
+    state.ws.onerror = () => {
+      state.connected = false;
+      updateConnectionStatus(false);
+    };
+
+  } catch (error) {
+    console.log("WebSocket error:", error);
+
+    state.connected = false;
+
+    updateConnectionStatus(false);
+  }
+}
+
+function send(data) {
+  if (
+    !state.ws ||
+    state.ws.readyState !== WebSocket.OPEN
+  ) {
+    showToast("هنوز به سرور متصل نیستی.");
+    return false;
+  }
+
+  state.ws.send(JSON.stringify(data));
+  return true;
+}
+
+/* =========================
+   Connection Status
+========================= */
+
+function updateConnectionStatus(online) {
+  const status = $("connectionStatus");
+
+  if (!status) return;
+
+  status.textContent = online
+    ? "🟢 آنلاین"
+    : "🔴 آفلاین";
+
+  status.classList.toggle(
+    "online",
+    online
+  );
+}
+
+/* =========================
+   Server Messages
+========================= */
+
+function handleOnlineMessage(message) {
+  if (!message || !message.type) return;
+
+  switch (message.type) {
+
+    case "hello":
+      if (message.playerId) {
+        state.player.id = message.playerId;
+        savePlayer();
+      }
+
+      if (message.room) {
+        state.room = message.room;
+        renderRoom();
+      }
+
+      if (message.rooms) {
+        state.rooms = message.rooms;
+        renderRooms();
+      }
+
+      break;
+
+    case "rooms":
+      state.rooms = message.rooms || [];
+      renderRooms();
+      break;
+
+    case "room_created":
+      state.room = message.room;
+      renderRoom();
+      break;
+
+    case "room_joined":
+      state.room = message.room;
+      renderRoom();
+      break;
+
+    case "room_update":
+      state.room = message.room;
+      renderRoom();
+      break;
+
+    case "room_left":
+      state.room = null;
+      showHome();
+      break;
+
+    case "chat":
+      receiveChat(message);
+      break;
+
+    case "game_state":
+      renderGameState(message.state);
+      break;
+
+    case "error":
+      showToast(
+        message.message || "خطایی رخ داد."
+      );
+      break;
+
+    default:
+      console.log(
+        "Unknown server message:",
+        message
+      );
+  }
+
+
+/* =========================
+   Rooms
+========================= */
+
+function createRoom() {
+  const roomNameInput = $("roomName");
+  const roomName = roomNameInput
+    ? roomNameInput.value.trim()
+    : "";
+
+  if (!state.connected) {
+    showToast("اول باید آنلاین شوی.");
+    return;
+  }
+
+  send({
+    type: "create_room",
+    name: roomName || "اتاق جدید",
+    gameId: state.selectedGame || 1
+  });
+}
+
+function joinRoom(roomId) {
+  if (!roomId) return;
+
+  if (!state.connected) {
+    showToast("اول باید آنلاین شوی.");
+    return;
+  }
+
+  send({
+    type: "join_room",
+    roomId
+  });
+}
+
+function leaveRoom() {
+  if (!state.room) return;
+
+  send({
+    type: "leave_room"
+  });
+}
+
+/* =========================
+   Room List
+========================= */
+
+function renderRooms() {
+  const container = $("roomsList");
+
+  if (!container) return;
+
+  if (!state.rooms.length) {
+    container.innerHTML = `
+      <div class="waiting">
+        هنوز اتاقی ساخته نشده است.
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = state.rooms.map(room => {
+    const game = getGame(room.gameId);
+
+    return `
+      <div class="room-card">
+        <div>
+          <strong>
+            ${escapeHTML(room.name || "اتاق")}
+          </strong>
+
+          <small>
+            ${game ? game.icon : "🎮"}
+            ${game ? escapeHTML(game.name) : "بازی"}
+          </small>
+
+          <small>
+            👥 ${room.players?.length || 0}/${room.maxPlayers || 8}
+          </small>
+        </div>
+
+        <button
+          onclick="joinRoom('${escapeHTML(room.id)}')"
+        >
+          ورود
+        </button>
+      </div>
+    `;
+  }).join("");
+}
+
+/* =========================
+   Current Room
+========================= */
+
+function renderRoom() {
+  const home = $("homeScreen");
+  const roomScreen = $("roomScreen");
+
+  if (!state.room) {
+    if (home) home.classList.remove("hidden");
+    if (roomScreen) roomScreen.classList.add("hidden");
+    return;
+  }
+
+  if (home) home.classList.add("hidden");
+  if (roomScreen) roomScreen.classList.remove("hidden");
+
+  renderRoomHeader();
+  renderPlayers();
+  renderRoomGame();
+  renderChat();
+}
+
+function renderRoomHeader() {
+  if (!state.room) return;
+
+  const title = $("roomTitle");
+  const code = $("roomCode");
+  const gameName = $("roomGameName");
+  const host = $("roomHost");
+
+  const game = getGame(state.room.gameId);
+
+  if (title) {
+    title.textContent =
+      state.room.name || "اتاق بازی";
+  }
+
+  if (code) {
+    code.textContent =
+      `کد اتاق: ${state.room.id}`;
+  }
+
+  if (gameName) {
+    gameName.textContent =
+      game
+        ? `${game.icon} ${game.name}`
+        : "🎮 بازی";
+  }
+
+  if (host) {
+    host.textContent =
+      `میزبان: ${state.room.hostName || "نامشخص"}`;
+  }
+}
+
+/* =========================
+   Players
+========================= */
+
+function renderPlayers() {
+  const container = $("playersList");
+
+  if (!container || !state.room) return;
+
+  const players = state.room.players || [];
+
+  container.innerHTML = players.map(player => `
+    <div class="player-card">
+
+      <div class="player-avatar">
+        ${escapeHTML(player.avatar || "😀")}
+      </div>
+
+      <div>
+        <div class="name">
+          ${escapeHTML(player.name || "بازیکن")}
+        </div>
+
+        <div class="score">
+          امتیاز: ${Number(player.score || 0)}
+        </div>
+      </div>
+
+      ${
+        player.id === state.room.hostId
+          ? `<span class="badge">👑 میزبان</span>`
+          : ""
+      }
+
+    </div>
+  `).join("");
+}
+
+/* =========================
+   Host
+========================= */
+
+function isHost() {
+  if (!state.room) return false;
+
+  return (
+    state.room.hostId === state.player.id
+  );
+}
+
+function startGame() {
+  if (!state.room) return;
+
+  if (!isHost()) {
+    showToast("فقط میزبان می‌تواند بازی را شروع کند.");
+    return;
+  }
+
+  send({
+    type: "start_game"
+  });
+}
+
+/* =========================
+   Change Game
+========================= */
+
+function changeRoomGame(gameId) {
+  if (!state.room) return;
+
+  if (!isHost()) {
+    showToast("فقط میزبان می‌تواند بازی را تغییر دهد.");
+    return;
+  }
+
+  const game = getGame(gameId);
+
+  if (!game) return;
+
+  send({
+    type: "change_game",
+    gameId: game.id
+  });
+}
+
+/* =========================
+   Room Game UI
+========================= */
+
+function renderRoomGame() {
+  const container = $("gameArea");
+
+  if (!container || !state.room) return;
+
+  const gameId = Number(state.room.gameId);
+
+  const game = getGame(gameId);
+
+  if (!game) {
+    container.innerHTML = `
+      <div class="waiting">
+        بازی انتخاب نشده است.
+      </div>
+    `;
+    return;
+  }
+
+  switch (gameId) {
+
+    case 2:
+      renderChess(container);
+      break;
+
+    case 10:
+      renderRPS(container);
+      break;
+
+    case 28:
+      renderDice(container);
+      break;
+
+    case 6:
+      renderQuiz(container);
+      break;
+
+    case 5:
+      renderWordGame(container);
+      break;
+
+    case 11:
+      renderTargetGame(container);
+      break;
+
+    case 18:
+      renderCoinGame(container);
+      break;
+
+    case 29:
+      renderTerritoryGame(container);
+      break;
+
+    case 8:
+      renderMinesweeper(container);
+      break;
+
+    default:
+      renderGenericGame(container, game);
+      break;
+  }
+}
+
+/* =========================
+   Generic Game
+========================= */
+
+function renderGenericGame(container, game) {
+  container.innerHTML = `
+    <div class="game-message">
+      <h3>
+        ${game.icon} ${escapeHTML(game.name)}
+      </h3>
+
+      <p>
+        بازیکنان آماده باشند!
+      </p>
+
+      <button
+        class="action-button"
+        onclick="sendGameMove('play')"
+      >
+        🎮 بازی
+      </button>
+    </div>
+  `;
+}
+
+function sendGameMove(action, data = {}) {
+  send({
+    type: "game_move",
+    action,
+    data
+  });
+}
+
+/* =========================
+   Rock Paper Scissors
+========================= */
+
+function renderRPS(container) {
+  container.innerHTML = `
+    <div class="game-message">
+      <h3>✊ سنگ کاغذ قیچی</h3>
+      <p>حرکت خودت را انتخاب کن:</p>
+    </div>
+
+    <div class="rps-buttons">
+
+      <button onclick="playRPS('rock')">
+        ✊
+        <span>سنگ</span>
+      </button>
+
+      <button onclick="playRPS('paper')">
+        ✋
+        <span>کاغذ</span>
+      </button>
+
+      <button onclick="playRPS('scissors')">
+        ✌️
+        <span>قیچی</span>
+      </button>
+
+    </div>
+  `;
+}
+
+function playRPS(choice) {
+  sendGameMove("rps", {
+    choice
+  });
+}
+
+/* =========================
+   Dice
+========================= */
+
+function renderDice(container) {
+  container.innerHTML = `
+    <div class="game-message">
+      <h3>🎲 بازی تاس</h3>
+      <p>
+        روی دکمه بزن تا تاس بیندازی.
+      </p>
+    </div>
+
+    <button
+      class="dice-button"
+      onclick="rollDice()"
+    >
+      🎲 انداختن تاس
+    </button>
+  `;
+}
+
+function rollDice() {
+  sendGameMove("dice");
+}
+
+/* =========================
+   Quiz
+========================= */
+
+function renderQuiz(container) {
+  const gameState =
+    state.room.gameState || {};
+
+  const question =
+    gameState.question ||
+    "سؤال هنوز آماده نشده است.";
+
+  const options =
+    gameState.options || [
+      "گزینه ۱",
+      "گزینه ۲",
+      "گزینه ۳",
+      "گزینه ۴"
+    ];
+
+  container.innerHTML = `
+    <div class="game-message">
+      <h3>🧠 مسابقه اطلاعات عمومی</h3>
+      <p>${escapeHTML(question)}</p>
+    </div>
+
+    <div class="quiz-options">
+
+      ${options.map((option, index) => `
+        <button
+          onclick="answerQuiz(${index})"
+        >
+          ${escapeHTML(option)}
+        </button>
+      `).join("")}
+
+    </div>
+  `;
+}
+
+function answerQuiz(index) {
+  sendGameMove("quiz_answer", {
+    answer: index
+  });
+}
+
+/* =========================
+   Word Game
+========================= */
+
+function renderWordGame(container) {
+  const gameState =
+    state.room.gameState || {};
+
+  const hint =
+    gameState.hint || "کلمه را حدس بزن.";
+
+  container.innerHTML = `
+    <div class="game-message">
+      <h3>🔤 حدس کلمه</h3>
+      <p>${escapeHTML(hint)}</p>
+    </div>
+
+    <div class="word-form">
+
+      <input
+        id="wordInput"
+        type="text"
+        placeholder="کلمه..."
+      />
+
+      <button
+        onclick="submitWord()"
+      >
+        ارسال
+      </button>
+
+    </div>
+  `;
+}
+
+function submitWord() {
+  const input = $("wordInput");
+
+  if (!input) return;
+
+  const word = input.value.trim();
+
+  if (!word) {
+    showToast("یک کلمه وارد کن.");
+    return;
+  }
+
+  sendGameMove("word", {
+    word
+  });
+
+  input.value = "";
+}
+
+/* =========================
+   Target
+========================= */
+
+function renderTargetGame(container) {
+  container.innerHTML = `
+    <div class="game-message">
+      <h3>🎯 تیراندازی به هدف</h3>
+      <p>هدف را بزن!</p>
+    </div>
+
+    <div
+      class="target-box"
+      id="targetBox"
+      onclick="shootTarget(event)"
+    >
+      <div
+        class="target"
+        id="target"
+        style="left:45%;top:40%;"
+      >
+        🎯
+      </div>
+    </div>
+  `;
+}
+
+function shootTarget(event) {
+  const box = $("targetBox");
+
+  if (!box) return;
+
+  const rect = box.getBoundingClientRect();
+
+  const x =
+    ((event.clientX - rect.left) / rect.width) * 100;
+
+  const y =
+    ((event.clientY - rect.top) / rect.height) * 100;
+
+  sendGameMove("target", {
+    x,
+    y
+  });
+}
+
+/* =========================
+   Coins
+========================= */
+
+function renderCoinGame(container) {
+  container.innerHTML = `
+    <div class="game-message">
+      <h3>🪙 جمع‌آوری سکه</h3>
+      <p>برای گرفتن سکه روی دکمه بزن.</p>
+    </div>
+
+    <button
+      class="action-button"
+      onclick="collectCoin()"
+    >
+      🪙 جمع کردن سکه
+    </button>
+  `;
+}
+
+function collectCoin() {
+  sendGameMove("coin");
+}
+
+/* =========================
+   Territory
+========================= */
+
+function renderTerritoryGame(container) {
+  const gameState =
+    state.room.gameState || {};
+
+  const cells =
+    gameState.cells || Array(25).fill(null);
+
+  container.innerHTML = `
+    <div class="game-message">
+      <h3>🗺️ تسخیر قلمرو</h3>
+      <p>یک خانه را انتخاب کن.</p>
+    </div>
+
+    <div class="territory-grid">
+
+      ${cells.map((owner, index) => `
+        <button
+          class="territory-cell ${owner ? "owned" : ""}"
+          onclick="claimTerritory(${index})"
+        >
+          ${owner ? "👤" : ""}
+        </button>
+      `).join("")}
+
+    </div>
+  `;
+}
+
+function claimTerritory(index) {
+  sendGameMove("territory", {
+    index
+  });
+}
+
+/* =========================
+   Minesweeper
+========================= */
+
+function renderMinesweeper(container) {
+  const gameState =
+    state.room.gameState || {};
+
+  const cells =
+    gameState.cells || Array(64).fill(null);
+
+  container.innerHTML = `
+    <div class="game-message">
+      <h3>💣 مین‌یاب</h3>
+      <p>یک خانه را انتخاب کن.</p>
+    </div>
+
+    <div class="mine-grid">
+
+      ${cells.map((cell, index) => `
+        <button
+          class="mine-cell ${cell?.open ? "open" : ""}"
+          onclick="openMineCell(${index})"
+        >
+          ${
+            cell?.open
+              ? escapeHTML(cell.value ?? "")
+              : ""
+          }
+        </button>
+      `).join("")}
+
+    </div>
+  `;
+}
+
+function openMineCell(index) {
+  sendGameMove("mine_open", {
+    index
+  });
+}
+
+/* =========================
+   Chess
+========================= */
+
+function renderChess(container) {
+  const board =
+    state.room.gameState?.board ||
+    createEmptyChessBoard();
+
+  container.innerHTML = `
+    <div class="game-message">
+      <h3>♟️ شطرنج</h3>
+      <p>صفحه شطرنج آنلاین</p>
+    </div>
+
+    <div class="chess-board">
+
+      ${board.map((piece, index) => {
+
+        const row = Math.floor(index / 8);
+        const col = index % 8;
+
+        const light =
+          (row + col) % 2 === 0;
+
+        return `
+          <button
+            class="chess-cell ${light ? "light" : "dark"}"
+            onclick="chessMove(${index})"
+          >
+            ${escapeHTML(piece || "")}
+          </button>
+        `;
+
+      }).join("")}
+
+    </div>
+  `;
+}
+
+function createEmptyChessBoard() {
+  return Array(64).fill("");
+}
+
+function chessMove(index) {
+  sendGameMove("chess_move", {
+    index
+  });
+}
+
+/* =========================
+   Game State
+========================= */
+
+function renderGameState(gameState) {
+  if (!state.room) return;
+
+  state.room.gameState =
+    gameState || {};
+
+  renderRoomGame();
+  renderPlayers();
+}
+
+/* =========================
+   Chat
+========================= */
+
+function sendChat() {
+  const input = $("chatInput");
+
+  if (!input) return;
+
+  const text = input.value.trim();
+
+  if (!text) return;
+
+  send({
+    type: "chat",
+    text
+  });
+
+  input.value = "";
+}
+
+function receiveChat(message) {
+  state.messages.push({
+    name:
+      message.name ||
+      message.playerName ||
+      "بازیکن",
+
+    avatar:
+      message.avatar ||
+      "😀",
+
+    text:
+      message.text || ""
+  });
+
+  renderChat();
+}
+
+function renderChat() {
+  const container = $("chatMessages");
+
+  if (!container) return;
+
+  container.innerHTML =
+    state.messages.map(message => `
+      <div class="chat-message">
+
+        <strong>
+          ${escapeHTML(message.avatar)}
+          ${escapeHTML(message.name)}
+        </strong>
+
+        <p>
+          ${escapeHTML(message.text)}
+        </p>
+
+      </div>
+    `).join("");
+
+  container.scrollTop =
+    container.scrollHeight;
+}
+
+/* =========================
+   Navigation
+========================= */
+
+function showHome() {
+  state.room = null;
+
+  const home = $("homeScreen");
+  const room = $("roomScreen");
+
+  if (home) {
+    home.classList.remove("hidden");
+  }
+
+  if (room) {
+    room.classList.add("hidden");
+  }
+
+  renderRooms();
+}
+
+function showRoom() {
+  if (!state.room) return;
+
+  const home = $("homeScreen");
+  const room = $("roomScreen");
+
+  if (home) {
+    home.classList.add("hidden");
+  }
+
+  if (room) {
+    room.classList.remove("hidden");
+  }
+
+  renderRoom();
+}
+
+/* =========================
+   Buttons
+========================= */
+
+function setupButtons() {
+
+  const loginButton =
+    $("loginButton");
+
+  if (loginButton) {
+    loginButton.addEventListener(
+      "click",
+      login
+    );
+  }
+
+  const createButton =
+    $("createRoomButton");
+
+  if (createButton) {
+    createButton.addEventListener(
+      "click",
+      createRoom
+    );
+  }
+
+  const startButton =
+    $("startGameButton");
+
+  if (startButton) {
+    startButton.addEventListener(
+      "click",
+      startGame
+    );
+  }
+
+  const leaveButton =
+    $("leaveRoomButton");
+
+  if (leaveButton) {
+    leaveButton.addEventListener(
+      "click",
+      leaveRoom
+    );
+  }
+
+  const chatButton =
+    $("sendChatButton");
+
+  if (chatButton) {
+    chatButton.addEventListener(
+      "click",
+      sendChat
+    );
+  }
+
+  const chatInput =
+    $("chatInput");
+
+  if (chatInput) {
+    chatInput.addEventListener(
+      "keydown",
+      event => {
+        if (event.key === "Enter") {
+          sendChat();
+        }
+      }
+    );
+  }
+}
+
+/* =========================
+   Start App
+========================= */
+
+document.addEventListener(
+  "DOMContentLoaded",
+  () => {
+
+    loadPlayer();
+
+    setupSearch();
+
+    setupButtons();
+
+    renderGames();
+
+    renderRooms();
+
+    renderProfile();
+
+    const savedName =
+      state.player.name;
+
+    const nameInput =
+      $("playerName");
+
+    if (nameInput && savedName) {
+      nameInput.value = savedName;
+    }
+
+    const avatarInput =
+      $("playerAvatar");
+
+    if (
+      avatarInput &&
+      state.player.avatar
+    ) {
+      avatarInput.value =
+        state.player.avatar;
+    }
+
+  }
+);
